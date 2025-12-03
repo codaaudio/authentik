@@ -339,11 +339,26 @@ class TokenParams:
         user = User.objects.filter(username=username, is_active=True).first()
         if not user:
             raise TokenError("invalid_grant")
-        token: Token = Token.filter_not_expired(
+
+        token: Token | None = None
+
+        # First, try to authenticate with token for all user types
+        token = Token.filter_not_expired(
             key=password, intent=TokenIntents.INTENT_APP_PASSWORD, user=user
         ).first()
-        if not token or token.user.uid != user.uid:
+
+        if token and token.user.uid == user.uid:
+            # Token authentication succeeded
+            pass
+        elif user.type == UserTypes.INTERNAL:
+            # Token auth failed, try password for internal users
+            token = None
+            if not user.check_password(password):
+                raise TokenError("invalid_grant")
+        else:
+            # Token auth failed and user is not internal
             raise TokenError("invalid_grant")
+
         self.user = user
         # Authorize user access
         app = Application.objects.filter(provider=self.provider).first()
@@ -351,16 +366,25 @@ class TokenParams:
             raise TokenError("invalid_grant")
         self.__check_policy_access(app, request)
 
-        Event.new(
-            action=EventAction.LOGIN,
-            **{
-                PLAN_CONTEXT_METHOD: "token",
-                PLAN_CONTEXT_METHOD_ARGS: {
-                    "identifier": token.identifier,
+        if token:
+            Event.new(
+                action=EventAction.LOGIN,
+                **{
+                    PLAN_CONTEXT_METHOD: "token",
+                    PLAN_CONTEXT_METHOD_ARGS: {
+                        "identifier": token.identifier,
+                    },
+                    PLAN_CONTEXT_APPLICATION: app,
                 },
-                PLAN_CONTEXT_APPLICATION: app,
-            },
-        ).from_http(request, user=user)
+            ).from_http(request, user=user)
+        else:
+            Event.new(
+                action=EventAction.LOGIN,
+                **{
+                    PLAN_CONTEXT_METHOD: "password",
+                    PLAN_CONTEXT_APPLICATION: app,
+                },
+            ).from_http(request, user=user)
 
     def __validate_jwt_from_source(
         self, assertion: str
